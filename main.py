@@ -1,12 +1,23 @@
+import os
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import date
+from sqlalchemy.orm import Session
+from fastapi import Depends
+from database import crear_tablas, get_db, Parcela
 
 load_dotenv()
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+def startup():
+	crear_tablas()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,8 +30,6 @@ app.add_middleware(
 def ping():
     return {"status": "ok"}
 
-
-# ---- NUEVO: modelos de datos ----
 
 class SolicitudAlerta(BaseModel):
     lat: float
@@ -35,8 +44,6 @@ class RespuestaAlerta(BaseModel):
     audio_url: str | None = None
 
 
-# ---- NUEVO: funciones stub ----
-
 def calcular_fase_fenologica(fecha_siembra: date, cultivo: str) -> str:
     dias = (date.today() - fecha_siembra).days
     if dias < 20:
@@ -46,9 +53,67 @@ def calcular_fase_fenologica(fecha_siembra: date, cultivo: str) -> str:
     else:
         return "R5 (llenado de grano)"
 
+
+def extraer_clima_total_gps(latitud, longitud):
+    url = "https://api.open-meteo.com/v1/forecast"
+
+    parametros = {
+        "latitude": latitud,
+        "longitude": longitud,
+        "daily": [
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "precipitation_sum",
+            "precipitation_probability_max",
+            "uv_index_max",
+            "et0_fao_evapotranspiration",
+            "shortwave_radiation_sum"
+        ],
+        "hourly": [
+            "relative_humidity_2m",
+            "dew_point_2m",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+            "soil_temperature_10cm",
+            "soil_moisture_10_to_28cm",
+            "vapor_pressure_deficit"
+        ],
+        "timezone": "auto"
+    }
+
+    respuesta = requests.get(url, params=parametros, timeout=10)
+    respuesta.raise_for_status()
+    return respuesta.json()
+
+
 def consultar_clima(lat: float, lon: float) -> dict:
-    # TODO: reemplazar con API real de clima
-    return {"humedad": 85, "temperatura": 26, "lluvia_mm": 40}
+    try:
+        datos_crudos = extraer_clima_total_gps(lat, lon)
+
+        # Promedios/valores del dia actual (indice 0) para resumen simple
+        temp_max = datos_crudos["daily"]["temperature_2m_max"][0]
+        temp_min = datos_crudos["daily"]["temperature_2m_min"][0]
+        temperatura_promedio = (temp_max + temp_min) / 2
+
+        lluvia_mm = datos_crudos["daily"]["precipitation_sum"][0]
+
+        humedades = datos_crudos["hourly"]["relative_humidity_2m"][:24]
+        humedad_promedio = sum(humedades) / len(humedades)
+
+        humedad_suelo = datos_crudos["hourly"]["soil_moisture_10_to_28cm"][:24]
+        humedad_suelo_promedio = sum(humedad_suelo) / len(humedad_suelo)
+
+        return {
+            "humedad": round(humedad_promedio, 1),
+            "temperatura": round(temperatura_promedio, 1),
+            "lluvia_mm": lluvia_mm,
+            "humedad_suelo": round(humedad_suelo_promedio, 3),
+            "evapotranspiracion": datos_crudos["daily"]["et0_fao_evapotranspiration"][0],
+            "raw": datos_crudos  # dato completo, por si el AI Engineer lo necesita
+        }
+    except (requests.RequestException, KeyError, IndexError) as e:
+        return {"humedad": 60, "temperatura": 25, "lluvia_mm": 0, "error": str(e)}
+
 
 def generar_alerta_rag(clima: dict, fase: str, cultivo: str) -> dict:
     # TODO: reemplazar por llamada real al modulo del AI Engineer
@@ -59,13 +124,19 @@ def generar_alerta_rag(clima: dict, fase: str, cultivo: str) -> dict:
     }
 
 
-# ---- NUEVO: endpoint principal ----
-
 @app.post("/generar-alerta", response_model=RespuestaAlerta)
-def generar_alerta(datos: SolicitudAlerta):
+def generar_alerta(datos: SolicitudAlerta, db: Session = Depends(get_db)):
     fase = calcular_fase_fenologica(datos.fecha_siembra, datos.cultivo)
     clima = consultar_clima(datos.lat, datos.lon)
     resultado_rag = generar_alerta_rag(clima, fase, datos.cultivo)
+
+	
+    nueva_parcela = Parcela(
+    lat = datos.lat, lon = datos.lon, fecha_siembra = datos.fecha_siembra, cultivo = datos.cultivo    
+    )
+
+    db.add(nueva_parcela)
+    db.commit()
 
     return RespuestaAlerta(
         alerta=resultado_rag["texto"],
